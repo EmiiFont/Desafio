@@ -7,6 +7,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"os"
 	"sync"
 
 	"github.com/google/uuid"
@@ -169,7 +170,7 @@ func initRepositories(db *sql.DB) *Repositories {
 }
 
 func initDbConnection() *sql.DB {
-	connStr := ""
+	connStr := os.Getenv("SUPABASE_CONN")
 	// Connect to database
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
