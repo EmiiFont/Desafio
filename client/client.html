@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Client</title>
+    <link rel="stylesheet" type="text/css" href="client.css">
+    <script>
+        // Example client-side code using JavaScript
+
+        const lobbyID = ""; // Replace with the actual lobby ID
+
+        // Establish WebSocket connection with the lobby ID included as a query parameter
+        const socket = new WebSocket(`ws://localhost:8000/ws?lobbyId=${lobbyID}`);
+
+        // Handle incoming messages from the server
+        socket.onmessage = function(event) {
+        const message = event.data;
+        // Process the received message
+        console.log("Received message:", message);
+        };
+
+        socket.onopen = function(event) {
+         const message  = {
+            type: "joinLobby",
+          
+         }
+         const data = JSON.stringify({
+            playerId:  getRandomIntInclusive(1, 2),
+         
+         })
+    
+            socket.send(JSON.stringify({...message, data}));
+         }
+
+        // Send a message to the server
+        function sendMessage(message) {
+             socket.send(message);
+        }
+
+        function getRandomIntInclusive(min, max) {
+  min = Math.ceil(min);
+  max = Math.floor(max);
+  return Math.floor(Math.random() * (max - min + 1) + min); // The maximum is inclusive and the minimum is inclusive
+}
+
+    </script>
+</head>
+    <body>
+
+    </body>
+</html>
