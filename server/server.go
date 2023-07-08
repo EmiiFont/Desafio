@@ -169,7 +169,7 @@ func initRepositories(db *sql.DB) *Repositories {
 }
 
 func initDbConnection() *sql.DB {
-	connStr := "postgres://postgres:Dop0VjfvDKZiJhqi@db.cghviokakyftkvzydpmd.supabase.co:6543/postgres"
+	connStr := ""
 	// Connect to database
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
