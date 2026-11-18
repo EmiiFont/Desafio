@@ -1,0 +1,17 @@
+2026/01/05 16:04:07 Warning: Error loading .env file: open .env: no such file or directory
+2026/01/05 16:04:07 Database initialized successfully
+2026/01/05 16:04:07 Initializing database...
+2026/01/05 16:04:07 Database initialized successfully
+2026/01/05 16:04:07 Loading lobbies from database...
+2026/01/05 16:04:07 Loaded lobby 00000000-0000-0000-0000-000000000001 from database
+2026/01/05 16:04:07 Restored lobby 00000000-0000-0000-0000-000000000001 with 0 players
+2026/01/05 16:04:07 Saved lobby 00000000-0000-0000-0000-000000000001 to database
+2026/01/05 16:04:07 Saved demo lobby to database
+2026/01/05 16:04:07 Demo lobby ID: 00000000-0000-0000-0000-000000000001
+2026/01/05 16:04:07 WebSocket handler registered
+2026/01/05 16:04:07 Game server ready on ws://localhost:8000/ws
+2026/01/05 16:04:07 Starting game server on http://localhost:8000
+2026/01/05 16:04:07 WebSocket endpoint: ws://localhost:8000/ws
+2026/01/05 16:04:07 Frontend (SolidJS): http://localhost:8000
+2026/01/05 16:04:35 Failed to upgrade connection: websocket: the client is not using the websocket protocol: request method is not GET
+signal: killed

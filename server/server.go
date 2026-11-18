@@ -7,45 +7,23 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
-	"os"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type Client struct {
 	conn     *websocket.Conn
 	PlayerId int
-	Lobby    *Lobby
-}
-
-type Lobby struct {
-	Id      uuid.UUID       `json:"id"`
-	Clients map[int]*Client `json:"clients"`
+	Lobby    *GameLobby
 }
 
 type Message struct {
 	Type string `json:"type"`
 	Data string `json:"data"`
-}
-
-type PlayerJoin struct {
-	PlayerId int `json:"playerId"`
-}
-
-type PlayerMove struct {
-	PlayerId int   `json:"playerId"`
-	Position []int `json:"position"`
-	Steps    int   `json:"steps"`
-}
-
-type GameStart struct {
-	Board            [][]int   `json:"board"`
-	LobbyId          uuid.UUID `json:"lobbyId"`
-	PlayerTurn       int       `json:"playerTurn"`
-	WaitingForPlayer bool      `json:"waitingForPlayer"`
-	PlayerId         int       `json:"playerId"`
 }
 
 type Pool struct {
@@ -59,11 +37,7 @@ func NewPool() *Pool {
 }
 
 const (
-	//message types
-	JoinLobbyMessage = "joinLobby"
-	MoveMessage      = "move"
-	StartGameMessage = "startGame"
-	boardSize        = 5
+	boardSize = 5
 )
 
 var (
@@ -72,25 +46,40 @@ var (
 		WriteBufferSize: 1024,
 		CheckOrigin:     func(r *http.Request) bool { return true },
 	}
-	lobbyMutex sync.Mutex
+	lobbyMutex  sync.Mutex
+	lobbies     = make(map[uuid.UUID]*GameLobby)
+	clientConns = make(map[int]*websocket.Conn)
+	clientMutex sync.Mutex
+	repo        = NewQuestionRepository()
+	db          *sql.DB
+	dbMutex     sync.RWMutex
 )
 
-func createLobby(lobbies map[uuid.UUID]*Lobby) *Lobby {
+func createLobby() *GameLobby {
 	lobbyMutex.Lock()
 	defer lobbyMutex.Unlock()
 
 	lobbyID := uuid.New()
-
-	lobby := &Lobby{
+	lobby := &GameLobby{
 		Id:      lobbyID,
-		Clients: make(map[int]*Client),
+		Players: make(map[int]*GamePlayer),
+	}
+	lobbies[lobbyID] = lobby
+
+	if db != nil {
+		SaveLobby(lobby)
 	}
 
-	lobbies[lobbyID] = lobby
 	return lobby
 }
 
-func handleWebsocket(lobbies map[uuid.UUID]*Lobby, lobbyId string, repositories *Repositories, w http.ResponseWriter, r *http.Request) {
+func getLobby(id uuid.UUID) *GameLobby {
+	lobbyMutex.Lock()
+	defer lobbyMutex.Unlock()
+	return lobbies[id]
+}
+
+func handleWebsocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrade.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("Failed to upgrade connection: %v", err)
@@ -98,267 +87,364 @@ func handleWebsocket(lobbies map[uuid.UUID]*Lobby, lobbyId string, repositories 
 	}
 	defer conn.Close()
 
-	var lobby *Lobby
-	if lobbyId == "" {
-		lobby = createLobby(lobbies)
+	lobbyIdStr := r.URL.Query().Get("lobbyId")
+
+	var lobby *GameLobby
+	if lobbyIdStr == "" {
+		lobby = createLobby()
 	} else {
-		lobby = lobbies[uuid.MustParse(lobbyId)]
+		lobbyId, err := uuid.Parse(lobbyIdStr)
+		if err != nil {
+			log.Printf("Invalid lobby ID: %v", err)
+			sendError(conn, "Invalid lobby ID")
+			return
+		}
+		lobby = getLobby(lobbyId)
 		if lobby == nil {
-			fmt.Println("Lobby not found")
+			sendError(conn, "Lobby not found")
 			return
 		}
 	}
 
-	// send the client their player id
-	// new client connected send them the current game state
-	playerId := rand.Intn(10)
+	playerId := rand.Intn(100000)
 	client := &Client{
 		conn:     conn,
 		PlayerId: playerId,
+		Lobby:    lobby,
 	}
-	lobby.Clients[playerId] = client
 
-	if err != nil {
-		log.Printf("Failed to write message to client: %v", err)
-		return
+	lobby.Players[playerId] = &GamePlayer{
+		Id:       playerId,
+		Name:     fmt.Sprintf("Player %d", playerId%1000),
+		Color:    PlayerColors[len(lobby.Players)%len(PlayerColors)],
+		Position: []int{0, 0},
+		Km:       0,
 	}
-	// Create a channel to track the closing of the connection
-	// this is to make sure the connection stays open until we want to close it
-	// using gorutines and channels to handle multiple clients
-	//closeChan := make(chan bool)
 
-	lobby.handleClient(client, repositories)
-	//<-closeChan
+	clientMutex.Lock()
+	clientConns[playerId] = conn
+	clientMutex.Unlock()
 
-	// Clean up client and close the connection
-	//delete(lobby.Clients, client.PlayerId)
-	//conn.Close()
+	log.Printf("Player %d joined lobby %s", playerId, lobby.Id)
+
+	sendLobbyStateToClient(lobby, conn, playerId)
+
+	go lobby.handleClient(client)
 }
 
-func (lobby *Lobby) handleClient(client *Client, repositories *Repositories) {
+func (lobby *GameLobby) handleClient(client *Client) {
 	defer func() {
-		//close(closeChan)
+		clientMutex.Lock()
+		delete(clientConns, client.PlayerId)
+		clientMutex.Unlock()
 		client.conn.Close()
-		delete(lobby.Clients, client.PlayerId)
+		delete(lobby.Players, client.PlayerId)
+		broadcastLobbyState(lobby)
 	}()
 
 	for {
-		som, b, err := client.conn.ReadMessage()
+		_, data, err := client.conn.ReadMessage()
 		var msg Message
 		if err != nil {
-			log.Printf("Failed to read message from client: %v", err)
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("WebSocket error for player %d: %v", client.PlayerId, err)
+			}
 			break
 		}
-		log.Print(som)
-		err = json.Unmarshal(b, &msg)
+		err = json.Unmarshal(data, &msg)
 		if err != nil {
-			log.Printf("Failed to unmarshal message from client: %v", err)
+			log.Printf("Failed to unmarshal message: %v", err)
+			continue
 		}
-		log.Printf("Received message from client: %s", msg.Type)
-		lobby.broadcast(msg, repositories)
+		log.Printf("Received message: %s", msg.Type)
+		lobby.handleMessage(client, msg)
 	}
 }
 
-type Repositories struct {
-	QuestionRepository *QuestionRepository
-}
-
-func initRepositories(db *sql.DB) *Repositories {
-	return &Repositories{
-		QuestionRepository: NewQuestionRepository(db),
-	}
-}
-
-func initDbConnection() *sql.DB {
-	connStr := os.Getenv("SUPABASE_CONN")
-	// Connect to database
-	db, err := sql.Open("postgres", connStr)
-	if err != nil {
-		log.Fatal(err)
-	}
-	db.Ping()
-	defer db.Close()
-
-	return db
-}
-
-func SetupServer() {
-	lobbies := make(map[uuid.UUID]*Lobby)
-	db := initDbConnection()
-	repositories := initRepositories(db)
-
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		lobbyId := r.URL.Query().Get("lobbyId")
-		// if lobbyId == "" {
-		// 	log.Printf("No lobby id provided")
-		// 	return
-		// }
-		handleWebsocket(lobbies, lobbyId, repositories, w, r)
-	})
-}
-
-func handlePlayerJoined(playerJoin *PlayerJoin, clients map[int]*Client, lobbyId uuid.UUID) {
-	var boardState Message
-	var gameStart GameStart
-
-	//make an 2d int array
-	boardArray := make([][]int, boardSize)
-
-	for i := 0; i < 5; i++ {
-		boardArray[i] = make([]int, boardSize)
-	}
-
-	for row := 0; row < len(boardArray); row++ {
-		for col := 0; col < len(boardArray[0]); col++ {
-			questionType := rand.Intn(3) + 1
-			boardArray[row][col] = questionType
+func (lobby *GameLobby) handleMessage(client *Client, msg Message) {
+	switch msg.Type {
+	case "setName":
+		var data map[string]string
+		json.Unmarshal([]byte(msg.Data), &data)
+		if player, ok := lobby.Players[client.PlayerId]; ok {
+			player.Name = data["name"]
 		}
-	}
+		broadcastLobbyState(lobby)
 
-	gameStart = GameStart{Board: boardArray,
-		PlayerTurn: 1, WaitingForPlayer: false, LobbyId: lobbyId, PlayerId: playerJoin.PlayerId}
-	if len(clients) == 1 {
-		gameStart.WaitingForPlayer = true
-	}
-
-	gameStartJson, err := json.Marshal(gameStart)
-
-	if err != nil {
-		log.Printf("Failed to marshal game start: %v", err)
-	}
-	boardState = Message{
-		Type: "loadBoard",
-		Data: string(gameStartJson),
-	}
-
-	for currentClient := range clients {
-		err := clients[currentClient].conn.WriteJSON(boardState)
-		if err != nil {
-			log.Printf("Failed to write message to client: %v", err)
+	case MsgCreateLobby:
+		var data CreateLobbyMessage
+		json.Unmarshal([]byte(msg.Data), &data)
+		if player, ok := lobby.Players[client.PlayerId]; ok {
+			player.Name = data.PlayerName
 		}
-	}
+		broadcastLobbyState(lobby)
 
-}
-
-func handlePlayerMove(playerMove *PlayerMove, lobby *Lobby) {
-	var boardState Message
-
-	newPosition := calculatePlayerPositionInBoard(playerMove)
-	playerMove.Position = newPosition
-	bodyJson, err := json.Marshal(playerMove)
-
-	if err != nil {
-		log.Printf("Failed to marshal game start: %v", err)
-	}
-	boardState = Message{
-		Type: "playerMove",
-		Data: string(bodyJson),
-	}
-	for currentClient := range lobby.Clients {
-		err := lobby.Clients[currentClient].conn.WriteJSON(boardState)
-		if err != nil {
-			log.Printf("Failed to write message to client: %v", err)
+	case MsgJoinLobby:
+		var data JoinLobbyMessage
+		json.Unmarshal([]byte(msg.Data), &data)
+		if player, ok := lobby.Players[client.PlayerId]; ok {
+			player.Name = data.PlayerName
 		}
-	}
-}
+		broadcastLobbyState(lobby)
 
-// send message to all clients in the pool and gameId
-func (lobby *Lobby) broadcast(message Message, repositories *Repositories) error {
-	switch message.Type {
-	case JoinLobbyMessage:
-		var playerJoin PlayerJoin
-		err := json.Unmarshal([]byte(message.Data), &playerJoin)
-		if err != nil {
-			log.Printf("Failed to unmarshal message from client: %v", err)
-		}
-		handlePlayerJoined(&playerJoin, lobby.Clients, lobby.Id)
+	case MsgEnableTestMode:
+		var data EnableTestModeMessage
+		json.Unmarshal([]byte(msg.Data), &data)
+		lobby.TestMode = data.Enabled
+		lobby.BotSpeed = data.BotSpeed
+		if data.Enabled {
+			for i := 0; i < 3; i++ {
+				lobby.AddBotPlayer(2)
+			}
+			broadcastLobbyState(lobby)
 
-	case MoveMessage:
-		//return board state to player and player turn.
-		var playerMove PlayerMove
-		err := json.Unmarshal([]byte(message.Data), &playerMove)
-		if err != nil {
-			log.Printf("Failed to unmarshal message from client: %v", err)
-		}
-		handlePlayerMove(&playerMove, lobby)
-	}
-	// if message.Type == "playerMove" {
-	// 	//return board state to player and player turn.
-	// 	//retrieve question from database and show to player
-	// 	//fmt.Println(message.Body)
-	// 	fmt.Println("Message type is player question")
-	// 	question := Message{
-	// 		Type: "playerMove",
-	// 		Data: "Player",
-	// 	} //repositories.QuestionRepository.GetQuestion()
-	// 	for currentClient := range clients {
-	// 		if clients[currentClient].PlayerId == message.PlayerId {
-	// 			err := clients[currentClient].conn.WriteJSON(question)
-	// 			if err != nil {
-	// 				log.Printf("Failed to write message to client: %v", err)
-	// 			}
-	// 		}
-	// 	}
-	// }
-
-	// //if message type is player answer
-	// if message.Type == "playerAnswer" {
-	// 	fmt.Println("Message type is player answer")
-	// 	//get question from database and check if answer is correct
-	// 	//if answer is correct, verify game end condition and send message to player
-	// 	//if answer is incorrect, send message to player change turn
-	// 	//if game end condition is met, send message to player
-	// 	for currentClient := range clients {
-	// 		if clients[currentClient].PlayerId == message.PlayerId {
-	// 			err := clients[currentClient].conn.WriteJSON(message)
-	// 			if err != nil {
-	// 				log.Printf("Failed to write message to client: %v", err)
-	// 			}
-	// 		}
-	// 	}
-	// }
-
-	// for currentClient := range clients {
-	// 	err := clients[currentClient].conn.WriteJSON(message)
-	// 	if err != nil {
-	// 		log.Printf("Failed to write message to client: %v", err)
-	// 	}
-	// }
-	return nil
-}
-
-// move player in a spiral pattern in the board based on the number of steps
-func calculatePlayerPositionInBoard(playerMove *PlayerMove) []int {
-	steps := playerMove.Steps
-	playerPosition := playerMove.Position
-
-	colLimit := boardSize - 1
-	rowLimit := boardSize - 1
-	// starting positions
-	left := playerPosition[1]
-	up := playerPosition[0]
-
-	for steps > 0 {
-		for i := left; i <= colLimit && steps >= 0; i++ {
-			playerPosition[1] = i
-			steps--
-		}
-		for i := up + 1; i <= rowLimit && steps >= 0; i++ {
-			playerPosition[0] = i
-			steps--
-		}
-
-		if up != rowLimit {
-			for i := colLimit - 1; i >= left && steps >= 0; i-- {
-				playerPosition[1] = i
-				steps--
+			if len(lobby.Players) >= 2 {
+				go func() {
+					time.Sleep(500 * time.Millisecond)
+					startGame(lobby)
+				}()
 			}
 		}
 
+	case "addBot":
+		var data map[string]int
+		json.Unmarshal([]byte(msg.Data), &data)
+		level := data["level"]
+		if level <= 0 {
+			level = 2
+		}
+		bot := lobby.AddBotPlayer(level)
+		log.Printf("Added bot %s (level %d) to lobby %s", bot.Name, level, lobby.Id)
+		broadcastLobbyState(lobby)
+		if db != nil {
+			SaveLobby(lobby)
+		}
+
+	case "startGame":
+		if len(lobby.Players) >= 2 {
+			startGame(lobby)
+		}
+
+	case MsgRollDice:
+		var data RollDiceMessage
+		json.Unmarshal([]byte(msg.Data), &data)
+		if data.PlayerId == lobby.GameState.CurrentPlayerId {
+			handleRollDice(lobby, data.PlayerId)
+		}
+
+	case MsgSubmitAnswer:
+		var data SubmitAnswerMessage
+		json.Unmarshal([]byte(msg.Data), &data)
+		handleSubmitAnswer(lobby, data)
+	}
+}
+
+func startGame(lobby *GameLobby) {
+	playerOrder := make([]int, 0, len(lobby.Players))
+	for id := range lobby.Players {
+		playerOrder = append(playerOrder, id)
+	}
+
+	for i := range playerOrder {
+		j := rand.Intn(i + 1)
+		playerOrder[i], playerOrder[j] = playerOrder[j], playerOrder[i]
+	}
+
+	board := GenerateSpiralBoard(boardSize)
+
+	lobby.GameState = &GameState{
+		Board:           board,
+		PlayerOrder:     playerOrder,
+		CurrentTurnIdx:  0,
+		CurrentPlayerId: playerOrder[0],
+		WaitingForRoll:  true,
+	}
+
+	for _, player := range lobby.Players {
+		player.Position = []int{0, 0}
+		player.Km = 0
+	}
+
+	gameStartMsg := GameStartMessage{
+		Board:           board,
+		Players:         getPlayerList(lobby),
+		PlayerOrder:     playerOrder,
+		CurrentPlayerId: playerOrder[0],
+		WaitingForRoll:  true,
+	}
+
+	broadcastToLobby(lobby, MsgGameStart, gameStartMsg)
+
+	if db != nil {
+		SaveLobby(lobby)
+	}
+
+	if lobby.TestMode {
+		firstPlayer := lobby.Players[playerOrder[0]]
+		if firstPlayer.IsBot {
+			delay := BotSpeedNormal
+			if lobby.BotSpeed > 0 {
+				delay = lobby.BotSpeed
+			}
+			lobby.ScheduleBotTurn(firstPlayer.Id, delay)
+		}
+	}
+}
+
+func handleRollDice(lobby *GameLobby, playerId int) {
+	result := lobby.RollDice(playerId)
+	lobby.GameState.WaitingForRoll = false
+	lobby.GameState.WaitingForAnswer = true
+
+	broadcastToLobby(lobby, MsgDiceResult, result)
+
+	questionMsg := lobby.GetQuestion(result.CategoryId, repo)
+	lobby.GameState.CurrentQuestion = &questionMsg.Question
+
+	broadcastToLobby(lobby, MsgQuestion, questionMsg)
+
+	if db != nil {
+		SaveLobby(lobby)
+	}
+
+	currentPlayer := lobby.Players[playerId]
+	if lobby.TestMode && currentPlayer.IsBot {
+		delay := BotSpeedNormal
+		if lobby.BotSpeed > 0 {
+			delay = lobby.BotSpeed
+		}
+		lobby.ScheduleBotTurn(playerId, delay)
+	}
+}
+
+func handleSubmitAnswer(lobby *GameLobby, data SubmitAnswerMessage) {
+	if !lobby.GameState.WaitingForAnswer || data.PlayerId != lobby.GameState.CurrentPlayerId {
+		return
+	}
+
+	question := lobby.GameState.CurrentQuestion
+	correct := ValidateAnswer(question, data.Answer)
+	kmChange := CalculateKmChange(data.AnswerType, correct)
+
+	player := lobby.Players[data.PlayerId]
+	player.Km += kmChange
+
+	if player.Km > 42 {
+		player.Km = 42
+	}
+
+	newPos := calculateSpiralPosition(player.Km)
+	player.Position = newPos
+
+	result := AnswerResultMessage{
+		PlayerId:    data.PlayerId,
+		Correct:     correct,
+		KmChange:    kmChange,
+		NewKm:       player.Km,
+		NewPosition: newPos,
+		Message:     fmt.Sprintf("%s answer! %s", map[bool]string{true: "Correct", false: "Wrong"}[correct], getKmMessage(kmChange)),
+	}
+
+	broadcastToLobby(lobby, MsgAnswerResult, result)
+
+	if CheckWinCondition(player) {
+		gameOverMsg := GameOverMessage{
+			Winner:  player,
+			Message: fmt.Sprintf("%s wins the race!", player.Name),
+		}
+		lobby.GameState.GameOver = true
+		lobby.GameState.Winner = player
+		broadcastToLobby(lobby, MsgGameOver, gameOverMsg)
+
+		if db != nil {
+			SaveLobby(lobby)
+		}
+		return
+	}
+
+	lobby.GameState.WaitingForAnswer = false
+
+	nextPlayer := lobby.GetNextPlayer()
+	turnMsg := TurnChangeMessage{
+		NextPlayer: nextPlayer,
+		Message:    fmt.Sprintf("It's %s's turn!", nextPlayer.Name),
+	}
+	lobby.GameState.WaitingForRoll = true
+	lobby.GameState.CurrentPlayerId = nextPlayer.Id
+
+	broadcastToLobby(lobby, MsgTurnChange, turnMsg)
+
+	if db != nil {
+		SaveLobby(lobby)
+	}
+
+	if lobby.TestMode && nextPlayer.IsBot && !lobby.GameState.GameOver {
+		delay := BotSpeedNormal
+		if lobby.BotSpeed > 0 {
+			delay = lobby.BotSpeed
+		}
+		lobby.ScheduleBotTurn(nextPlayer.Id, delay)
+	}
+}
+
+func getKmMessage(km int) string {
+	switch km {
+	case 2:
+		return "Moved 2km (direct answer)"
+	case 1:
+		return "Moved 1km (multiple choice)"
+	default:
+		return "No movement"
+	}
+}
+
+func calculateSpiralPosition(km int) []int {
+	if km == 0 {
+		return []int{0, 0}
+	}
+
+	stepsPerKm := 24.0 / 42.0
+	totalSteps := int(float64(km) * stepsPerKm)
+	steps := totalSteps
+
+	size := boardSize
+	colLimit := size - 1
+	rowLimit := size - 1
+	left, up := 0, 0
+
+	pos := []int{0, 0}
+
+	for steps > 0 {
+		for i := left; i <= colLimit && steps >= 0; i++ {
+			pos[1] = i
+			steps--
+			if steps == 0 {
+				return pos
+			}
+		}
+		for i := up + 1; i <= rowLimit && steps >= 0; i++ {
+			pos[0] = i
+			steps--
+			if steps == 0 {
+				return pos
+			}
+		}
+		if up != rowLimit {
+			for i := colLimit - 1; i >= left && steps >= 0; i-- {
+				pos[1] = i
+				steps--
+				if steps == 0 {
+					return pos
+				}
+			}
+		}
 		if left != colLimit {
 			for i := rowLimit - 1; i > up && steps >= 0; i-- {
-				playerPosition[0] = i
+				pos[0] = i
 				steps--
+				if steps == 0 {
+					return pos
+				}
 			}
 		}
 		left++
@@ -366,5 +452,263 @@ func calculatePlayerPositionInBoard(playerMove *PlayerMove) []int {
 		up++
 		rowLimit--
 	}
-	return playerPosition
+	return pos
+}
+
+func sendLobbyState(lobby *GameLobby, targetConn *websocket.Conn) {
+	players := getPlayerList(lobby)
+	state := LobbyStateMessage{
+		LobbyId: lobby.Id.String(),
+		Players: players,
+		Ready:   len(players) >= 2,
+		Message: getLobbyMessage(len(players)),
+	}
+
+	if targetConn != nil {
+		sendMessage(targetConn, MsgLobbyState, state)
+	} else {
+		broadcastLobbyState(lobby)
+	}
+}
+
+func sendLobbyStateToClient(lobby *GameLobby, conn *websocket.Conn, playerId int) {
+	players := getPlayerList(lobby)
+	state := LobbyStateMessage{
+		LobbyId: lobby.Id.String(),
+		Players: players,
+		Ready:   len(players) >= 2,
+		Message: getLobbyMessage(len(players)),
+	}
+	sendMessage(conn, MsgLobbyState, state)
+}
+
+func broadcastLobbyState(lobby *GameLobby) {
+	players := getPlayerList(lobby)
+	state := LobbyStateMessage{
+		LobbyId: lobby.Id.String(),
+		Players: players,
+		Ready:   len(players) >= 2,
+		Message: getLobbyMessage(len(players)),
+	}
+
+	for playerId := range lobby.Players {
+		sendToPlayer(playerId, MsgLobbyState, state)
+	}
+
+	if db != nil {
+		SaveLobby(lobby)
+	}
+}
+
+func getPlayerList(lobby *GameLobby) []*GamePlayer {
+	players := make([]*GamePlayer, 0, len(lobby.Players))
+	for _, p := range lobby.Players {
+		players = append(players, p)
+	}
+	return players
+}
+
+func getLobbyMessage(count int) string {
+	switch count {
+	case 0:
+		return "Waiting for players..."
+	case 1:
+		return "Waiting for more players..."
+	case 2, 3, 4:
+		return fmt.Sprintf("%d player(s) ready. Press Start!", count)
+	default:
+		return "Lobby full"
+	}
+}
+
+func broadcastToLobby(lobby *GameLobby, msgType string, data interface{}) {
+	for playerId := range lobby.Players {
+		sendToPlayer(playerId, msgType, data)
+	}
+}
+
+func sendToPlayer(playerId int, msgType string, data interface{}) {
+	clientMutex.Lock()
+	conn, ok := clientConns[playerId]
+	clientMutex.Unlock()
+
+	if !ok || conn == nil {
+		return
+	}
+
+	msg := map[string]interface{}{
+		"type": msgType,
+		"data": data,
+	}
+
+	clientMutex.Lock()
+	if err := conn.WriteJSON(msg); err != nil {
+		log.Printf("Failed to send message to player %d: %v", playerId, err)
+		delete(clientConns, playerId)
+		clientMutex.Unlock()
+	} else {
+		clientMutex.Unlock()
+	}
+}
+
+func sendWebSocketMessage(playerId int, lobby *GameLobby, msg interface{}) {
+	sendToPlayer(playerId, "", msg)
+}
+
+func getClientConn(playerId int, lobby *GameLobby) *websocket.Conn {
+	clientMutex.Lock()
+	defer clientMutex.Unlock()
+	return clientConns[playerId]
+}
+
+func sendJSON(conn *websocket.Conn, data interface{}) {
+	if conn != nil {
+		conn.WriteJSON(data)
+	}
+}
+
+func sendMessage(conn *websocket.Conn, msgType string, data interface{}) {
+	if conn == nil {
+		return
+	}
+	conn.WriteJSON(map[string]interface{}{
+		"type": msgType,
+		"data": data,
+	})
+}
+
+func sendError(conn *websocket.Conn, message string) {
+	sendMessage(conn, MsgError, ErrorMessage{Message: message})
+}
+
+func SetupServer() {
+	log.Println("Initializing database...")
+	if err := InitDatabase(); err != nil {
+		log.Printf("Warning: Failed to initialize database: %v", err)
+	}
+
+	lobbies = make(map[uuid.UUID]*GameLobby)
+	repo = NewQuestionRepository()
+	log.Println("Loading lobbies from database...")
+
+	if db != nil {
+		if err := LoadLobbiesFromDB(); err != nil {
+			log.Printf("Warning: Failed to load lobbies from database: %v", err)
+		} else {
+			for id, lobby := range lobbies {
+				lobbies[id] = lobby
+				log.Printf("Restored lobby %s with %d players", id.String(), len(lobby.Players))
+			}
+		}
+	}
+
+	demoLobbyId := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	demoLobby := &GameLobby{
+		Id:      demoLobbyId,
+		Players: make(map[int]*GamePlayer),
+	}
+	lobbies[demoLobbyId] = demoLobby
+
+	if db != nil {
+		SaveLobby(demoLobby)
+		log.Printf("Saved demo lobby to database")
+	}
+
+	log.Println("Demo lobby ID: 00000000-0000-0000-0000-000000000001")
+
+	http.HandleFunc("/ws", handleWebsocket)
+	log.Println("WebSocket handler registered")
+
+	log.Println("Game server ready on ws://localhost:8000/ws")
+}
+
+// Database functions
+func InitDatabase() error {
+	var err error
+	db, err = sql.Open("sqlite3", "./game_state.db")
+	if err != nil {
+		return fmt.Errorf("failed to open database: %w", err)
+	}
+
+	// Create tables
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS lobbies (
+			id TEXT PRIMARY KEY,
+			created_at INTEGER,
+			lobby_data TEXT
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create tables: %w", err)
+	}
+
+	log.Println("Database initialized successfully")
+	return nil
+}
+
+func SaveLobby(lobby *GameLobby) error {
+	if db == nil {
+		return nil
+	}
+
+	dbMutex.Lock()
+	defer dbMutex.Unlock()
+
+	lobbyJSON, err := json.Marshal(lobby)
+	if err != nil {
+		log.Printf("Failed to marshal lobby for database: %v", err)
+		return err
+	}
+
+	now := time.Now().Unix()
+	_, err = db.Exec(
+		"INSERT OR REPLACE INTO lobbies (id, created_at, lobby_data) VALUES (?, ?, ?)",
+		lobby.Id.String(), now, string(lobbyJSON),
+	)
+	if err != nil {
+		log.Printf("Failed to save lobby to database: %v", err)
+		return err
+	}
+
+	log.Printf("Saved lobby %s to database", lobby.Id.String())
+	return nil
+}
+
+func LoadLobbiesFromDB() error {
+	if db == nil {
+		return nil
+	}
+
+	rows, err := db.Query("SELECT id, created_at, lobby_data FROM lobbies ORDER BY created_at DESC")
+	if err != nil {
+		log.Printf("Failed to load lobbies from database: %v", err)
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id string
+		var createdAt int64
+		var lobbyData string
+
+		if err := rows.Scan(&id, &createdAt, &lobbyData); err != nil {
+			log.Printf("Failed to scan lobby row: %v", err)
+			continue
+		}
+
+		var lobby GameLobby
+		if err := json.Unmarshal([]byte(lobbyData), &lobby); err != nil {
+			log.Printf("Failed to unmarshal lobby data for %s: %v", id, err)
+			continue
+		}
+
+		lobbies[lobby.Id] = &lobby
+		log.Printf("Loaded lobby %s from database", lobby.Id.String())
+	}
+
+	if err := rows.Err(); err != nil {
+		log.Printf("Error iterating lobby rows: %v", err)
+	}
+
+	return nil
 }

@@ -1,9 +1,10 @@
 package main
 
 import (
-	"desafio/server"
 	"log"
 	"net/http"
+
+	"desafio/server"
 
 	"github.com/joho/godotenv"
 )
@@ -11,11 +12,24 @@ import (
 func main() {
 	err := godotenv.Load()
 	if err != nil {
-		log.Fatal("Error loading .env file")
+		log.Println("Warning: Error loading .env file:", err)
 	}
-	//configure env variables
+
+	// Initialize database
+	if err := server.InitDatabase(); err != nil {
+		log.Printf("Error initializing database: %v", err)
+	}
+
 	server.SetupServer()
-	log.Println("Starting game server... on port 8000")
+
+	// Serve SolidJS frontend from dist directory
+	fs := http.FileServer(http.Dir("./dist"))
+	http.Handle("/", fs)
+
+	log.Println("Starting game server on http://localhost:8000")
+	log.Println("WebSocket endpoint: ws://localhost:8000/ws")
+	log.Println("Frontend (SolidJS): http://localhost:8000")
+
 	err = http.ListenAndServe(":8000", nil)
 	if err != nil {
 		log.Fatal("Error starting server:", err)

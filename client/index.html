@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trivia Race - Marathon of Knowledge</title>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body x-data="game()" x-init="init()">
+    <div class="app-container">
+        <!-- Header -->
+        <header class="game-header">
+            <h1>🏃 Trivia Race</h1>
+            <p class="subtitle">Marathon of Knowledge</p>
+        </header>
+
+        <!-- Lobby View -->
+        <div x-show="view === 'lobby'" class="lobby-container">
+            <div class="lobby-card">
+                <h2>🎮 Game Lobby</h2>
+
+                <div class="lobby-section">
+                    <input
+                        type="text"
+                        x-model="playerName"
+                        placeholder="Your name"
+                        class="input-field"
+                    >
+                </div>
+
+                <div class="lobby-section">
+                    <button @click="createLobby()" class="btn btn-primary btn-large">
+                        ✨ Create New Lobby
+                    </button>
+                </div>
+
+                <div class="divider">
+                    <span>or</span>
+                </div>
+
+                <div class="lobby-section">
+                    <input
+                        type="text"
+                        x-model="lobbyIdInput"
+                        placeholder="Enter Lobby ID"
+                        class="input-field"
+                    >
+                    <button @click="joinLobby()" class="btn btn-secondary">
+                        🎯 Join Lobby
+                    </button>
+                </div>
+
+                <div x-show="lobbyId" class="lobby-info">
+                    <p>Your Lobby ID:</p>
+                    <code x-text="lobbyId" class="lobby-id"></code>
+                    <button @click="navigator.clipboard.writeText(lobbyId); showError('Lobby ID copied!')" class="btn btn-small">📋 Copy ID</button>
+                    <p x-text="lobbyMessage" class="lobby-status"></p>
+                </div>
+
+                <div x-show="players.length > 0" class="players-list">
+                    <h3>Players (<span x-text="players.length"></span>/4)</h3>
+                    <template x-for="player in players" :key="player.id">
+                        <div class="player-item" :style="{ borderColor: player.color }">
+                            <span class="player-color" :style="{ backgroundColor: player.color }"></span>
+                            <span x-text="player.name"></span>
+                            <span x-show="gameState && gameState.currentPlayerId === player.id" class="turn-indicator">
+                                🎲 Your Turn!
+                            </span>
+                        </div>
+                    </template>
+                </div>
+
+                <button
+                    x-show="canStartGame()"
+                    @click="startGame()"
+                    class="btn btn-success btn-large"
+                >
+                    🚀 Start Game!
+                </button>
+
+                <!-- Test Controls -->
+                <div class="test-controls">
+                    <h4>🧪 Testing</h4>
+                    <div class="test-buttons">
+                        <button @click="quickJoin()" class="btn btn-test">
+                            ⚡ Create Random Lobby
+                        </button>
+                        <button @click="addBotPlayer()" class="btn btn-test" x-show="lobbyId">
+                            🤖 Add Bot Player
+                        </button>
+                        <button @click="autoStartGame()" class="btn btn-test" x-show="players.length >= 2 && !gameStarted">
+                            🎮 Auto-Start Game
+                        </button>
+                        <button @click="quickJoinTest()" class="btn btn-test">
+                            🎯 Join Demo Lobby
+                        </button>
+                        <button @click="createTestGame()" class="btn btn-test">
+                            🆕 Create & Start Game
+                        </button>
+                        <button @click="startSinglePlayerTest()" class="btn btn-test">
+                            🎯 Single Player Test
+                        </button>
+                        <button @click="toggleDebugPanel()" class="btn btn-test">
+                            🐛 Debug Panel
+                        </button>
+                        <button @click="quickJoinTest(); $event.target.blur()" class="btn btn-test" x-show="!lobbyId">
+                            🎯 Demo Lobby
+                        </button>
+                    </div>
+                    <p class="test-hint">Use these buttons for quick testing</p>
+                </div>
+
+                <!-- Debug Panel -->
+                <div x-show="debugPanel" class="debug-panel">
+                    <div class="debug-header">
+                        <h4>🐛 Debug Panel</h4>
+                        <button @click="toggleDebugPanel()" class="close-btn">&times;</button>
+                    </div>
+                    
+                    <div class="debug-section">
+                        <h5>Bot Speed</h5>
+                        <div class="speed-controls">
+                            <button @click="setBotSpeed(3000)" class="btn btn-speed" :class="{ active: botSpeed === 3000 }">🐌 Slow</button>
+                            <button @click="setBotSpeed(1500)" class="btn btn-speed" :class="{ active: botSpeed === 1500 }">🚶 Normal</button>
+                            <button @click="setBotSpeed(500)" class="btn btn-speed" :class="{ active: botSpeed === 500 }">🏃 Fast</button>
+                            <button @click="setBotSpeed(100)" class="btn btn-speed" :class="{ active: botSpeed === 100 }">⚡ Instant</button>
+                        </div>
+                    </div>
+
+                    <div class="debug-section">
+                        <h5>Game State</h5>
+                        <div class="debug-info">
+                            <p><strong>Lobby ID:</strong> <code x-text="lobbyId.substring(0, 8) + '...'"></code></p>
+                            <p><strong>Your ID:</strong> <code x-text="myPlayerId"></code></p>
+                            <p><strong>Players:</strong> <span x-text="players.length"></span></p>
+                            <p><strong>Game Started:</strong> <span x-text="gameStarted ? 'Yes' : 'No'"></span></p>
+                            <template x-if="gameState">
+                                <div>
+                                    <p><strong>Waiting For:</strong> <span x-text="gameState.waitingForRoll ? 'Roll' : (gameState.waitingForAnswer ? 'Answer' : 'None')"></span></p>
+                                    <p><strong>Current Player:</strong> <span x-text="gameState.currentPlayerId"></span></p>
+                                </div>
+                            </template>
+                            <p><strong>Progress:</strong> <span x-text="getGameProgress()"></span>%</p>
+                        </div>
+                    </div>
+
+                    <div class="debug-section">
+                        <h5>Event Log</h5>
+                        <div class="debug-log">
+                            <template x-for="(entry, index) in debugLog" :key="index">
+                                <div class="log-entry">
+                                    <span class="log-time" x-text="entry.timestamp"></span>
+                                    <span class="log-action" x-text="entry.action"></span>
+                                </div>
+                            </template>
+                            <div x-show="debugLog.length === 0" class="log-empty">No events yet</div>
+                        </div>
+                    </div>
+
+                    <div class="debug-section">
+                        <h5>Keyboard Shortcuts</h5>
+                        <div class="shortcuts-list">
+                            <p><kbd>R</kbd> Roll dice (your turn)</p>
+                            <p><kbd>S</kbd> Start game</p>
+                            <p><kbd>B</kbd> Add bot player</p>
+                            <p><kbd>D</kbd> Toggle debug panel</p>
+                            <p><kbd>Esc</kbd> Close debug panel</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Game View -->
+        <div x-show="view === 'game'" class="game-container">
+            <!-- Game Info Bar -->
+            <div class="game-info-bar">
+                <div class="turn-info">
+                    <template x-if="gameState && gameState.waitingForRoll && myPlayerId === gameState.currentPlayerId">
+                        <div class="your-turn-banner">
+                            🎲 Your Turn! Roll the dice!
+                        </div>
+                    </template>
+                    <template x-if="gameState && !(gameState.waitingForRoll && myPlayerId === gameState.currentPlayerId)">
+                        <div class="other-turn-banner">
+                            Waiting for <span x-text="getCurrentPlayerName()"></span>...
+                        </div>
+                    </template>
+                </div>
+            </div>
+
+            <!-- Main Game Area -->
+            <div class="game-main">
+                <!-- Board -->
+                <div class="board-container">
+                    <div class="spiral-board">
+                        <template x-for="(row, rowIndex) in board" :key="rowIndex">
+                            <div class="board-row">
+                                <template x-for="(cell, colIndex) in row" :key="colIndex">
+                                    <div
+                                        class="board-cell"
+                                        :class="{
+                                            'cell-center': rowIndex === 2 && colIndex === 2,
+                                            'cell-finish': rowIndex === 2 && colIndex === 2
+                                        }"
+                                        :style="getCellStyle(cell)"
+                                    >
+                                        <span class="cell-km" x-text="getCellKm(rowIndex, colIndex)"></span>
+                                        <div class="cell-players">
+                                            <template x-for="player in getPlayersAt(rowIndex, colIndex)" :key="player.id">
+                                                <div
+                                                    class="player-token"
+                                                    :style="{ backgroundColor: player.color }"
+                                                    :title="player.name"
+                                                >
+                                                    <span x-text="player.name.charAt(0)"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </div>
+                                </template>
+                            </div>
+                        </template>
+                    </div>
+                    <div class="finish-label">🏁 42km</div>
+                </div>
+
+                <!-- Side Panel -->
+                <div class="side-panel">
+                    <!-- Player Cards -->
+                    <div class="player-cards">
+                        <template x-for="player in players" :key="player.id">
+                            <div
+                                class="player-card"
+                                :class="{ 'active-turn': gameState && gameState.currentPlayerId === player.id }"
+                                :style="{ borderColor: player.color }"
+                            >
+                                <div class="player-card-header">
+                                    <span class="player-token-small" :style="{ backgroundColor: player.color }"></span>
+                                    <span x-text="player.name"></span>
+                                </div>
+                                <div class="player-km">
+                                    <span x-text="player.km"></span> km
+                                </div>
+                                <div class="km-progress">
+                                    <div
+                                        class="km-progress-fill"
+                                        :style="{ width: (player.km / 42 * 100) + '%', backgroundColor: player.color }"
+                                    ></div>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Dice Button -->
+            <div x-show="gameState && gameState.waitingForRoll && myPlayerId === gameState.currentPlayerId" class="dice-section">
+                <button @click="rollDice()" class="btn btn-dice" :class="{ 'dice-rolling': diceAnimating }">
+                    <span x-show="!diceAnimating">🎲 Roll Dice</span>
+                    <span x-show="diceAnimating">Rolling...</span>
+                </button>
+            </div>
+        </div>
+
+        <!-- Question Modal -->
+        <div x-show="showQuestion" class="modal-overlay" x-transition:enter="modal-enter">
+            <div class="modal question-modal" x-show="showQuestion" x-transition>
+                <div class="question-header" :style="{ backgroundColor: currentCategory?.color }">
+                    <span class="category-emoji" x-text="currentCategory?.emoji"></span>
+                    <span class="category-name" x-text="currentCategory?.name"></span>
+                </div>
+
+                <div class="timer-section">
+                    <div class="timer" :class="{ 'timer-warning': timer <= 5 }">
+                        <span x-text="timer"></span>s
+                    </div>
+                    <div class="timer-bar">
+                        <div class="timer-fill" :style="{ width: (timer / 20 * 100) + '%' }"></div>
+                    </div>
+                </div>
+
+                <div class="question-text" x-text="currentQuestion?.description"></div>
+
+                <div class="answer-section">
+                    <div class="answer-type-toggle">
+                        <button
+                            @click="answerType = 'multiple'"
+                            class="btn btn-toggle"
+                            :class="{ 'active': answerType === 'multiple' }"
+                        >
+                            📋 Multiple Choice (+1km)
+                        </button>
+                        <button
+                            @click="answerType = 'direct'"
+                            class="btn btn-toggle"
+                            :class="{ 'active': answerType === 'direct' }"
+                        >
+                            ✍️ Direct Answer (+2km)
+                        </button>
+                    </div>
+
+                    <div class="options-grid" x-show="answerType === 'multiple'">
+                        <template x-for="(option, index) in currentQuestion?.options" :key="index">
+                            <button
+                                @click="submitAnswer(index)"
+                                class="option-btn"
+                                :class="{ 'selected': selectedAnswer === index }"
+                                :disabled="answerSubmitted"
+                            >
+                                <span class="option-letter" x-text="['A', 'B', 'C'][index]"></span>
+                                <span x-text="option"></span>
+                            </button>
+                        </template>
+                    </div>
+
+                    <div x-show="answerType === 'direct'" class="direct-answer-section">
+                        <p class="hint">Type your answer (exact match required):</p>
+                        <input
+                            type="text"
+                            x-model="directAnswer"
+                            @keyup.enter="submitDirectAnswer()"
+                            class="input-field"
+                            placeholder="Your answer..."
+                            :disabled="answerSubmitted"
+                        >
+                        <button
+                            @click="submitDirectAnswer()"
+                            class="btn btn-primary"
+                            :disabled="!directAnswer || answerSubmitted"
+                        >
+                            Submit Answer
+                        </button>
+                    </div>
+                </div>
+
+                <div x-show="answerResult" class="answer-feedback" :class="answerResult?.correct ? 'correct' : 'wrong'">
+                    <span x-text="answerResult?.message"></span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Turn Change Notification -->
+        <div
+            x-show="showTurnChange"
+            class="turn-notification"
+            x-transition
+            x-transition:leave="transition-opacity duration-500"
+        >
+            <div class="turn-notification-content">
+                <span x-text="turnChangeMessage"></span>
+            </div>
+        </div>
+
+        <!-- Game Over Modal -->
+        <div x-show="gameOver" class="modal-overlay">
+            <div class="modal game-over-modal">
+                <h2>🏆 Game Over!</h2>
+                <div class="winner-display">
+                    <div class="winner-token" :style="{ backgroundColor: winner?.color }">
+                        <span x-text="winner?.name?.charAt(0)"></span>
+                    </div>
+                    <h3 x-text="winner?.name"></h3>
+                    <p>Wins the race!</p>
+                </div>
+                <p class="congrats-message" x-text="winnerMessage"></p>
+                <button @click="resetGame()" class="btn btn-primary btn-large">
+                    🔄 Play Again
+                </button>
+            </div>
+        </div>
+
+        <!-- Connection Status -->
+        <div class="connection-status" :class="connected ? 'connected' : 'disconnected'">
+            <span x-text="connected ? '🟢 Connected' : '🔴 Disconnected'"></span>
+        </div>
+
+        <!-- Error Toast -->
+        <div x-show="errorMessage" class="error-toast" x-transition>
+            <span x-text="errorMessage"></span>
+            <button @click="errorMessage = null" class="close-btn">&times;</button>
+        </div>
+    </div>
+
+    <script src="js/game.js"></script>
+</body>
+</html>
