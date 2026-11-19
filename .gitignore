@@ -1,4 +1,18 @@
-.idea/modules.xml
-.idea/desafio.iml
-desafio
+# IDE
+.idea/
+
+# Build artifacts
+bin/
+
+# Dependencies
+node_modules/
+
+# Runtime data & logs
+*.db
+*.log
+
+# Env
 .env
+
+# Binary
+desafio
